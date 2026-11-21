@@ -195,9 +195,15 @@ class Selector:
         for t in self.tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
         self.all = set(self.by_num)
-        import gzip
-        with gzip.open(MAP, "rt") as f:
-            m = json.load(f)
+        cache = _load_cache()
+        if cache is not None:
+            m = cache["map"]
+            self._asg = cache["asg"]
+            self._ident = cache["ident"]
+        else:
+            import gzip
+            with gzip.open(MAP, "rt") as f:
+                m = json.load(f)
         # the map is keyed by test id so it survives renumbering
         ids = m["ids"]
         id2num = {t["id"]: t["number"] for t in self.tests}
@@ -608,6 +614,14 @@ class Selector:
     def readers(self, names):
         """Tests that ran any sqlglot source line mentioning one of `names` (or a name derived from them)."""
         names = self.derived(names)
+        if getattr(self, "_ident", None) is not None:
+            out = set()
+            for nm in names:
+                for f, ln in self._ident.get(nm, ()):
+                    v = self.lines.get(f, {}).get(str(ln))
+                    if v:
+                        out |= self.nums(v)
+            return out
         pat = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b")
         out = set()
         for f, src in self._sources().items():
@@ -664,6 +678,40 @@ class Selector:
         return set(self.all)
 
 
+# ------------------------------------------------------------------ build-time cache (docker build is not charged)
+CACHE = HERE / "cache.pkl"
+_IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+
+def _load_cache():
+    try:
+        import pickle
+        with open(CACHE, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def build_cache():
+    """Precompute the parsed map, the assignment table and an identifier -> (file, line) index."""
+    import gzip, pickle
+    with gzip.open(MAP, "rt") as f:
+        m = json.load(f)
+    tmp = Selector.__new__(Selector)
+    tmp._trees = {}
+    tmp._src_cache = None
+    tmp._asg = None
+    asg = tmp._assignments()
+    ident = {}
+    for f, src in tmp._sources().items():
+        for i, line in enumerate(src, 1):
+            for nm in set(_IDENT_RE.findall(line)):
+                ident.setdefault(nm, []).append((f, i))
+    with open(CACHE, "wb") as fh:
+        pickle.dump({"map": m, "asg": asg, "ident": ident}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    log("cache built", len(ident), "identifiers")
+
+
 # ------------------------------------------------------------------ worker split
 def split(nums, by_num):
     if not nums:
@@ -698,4 +746,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--build-cache":
+        build_cache()
+    else:
+        main()
