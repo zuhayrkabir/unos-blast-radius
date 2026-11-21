@@ -214,6 +214,43 @@ class Selector:
     def nums(self, idxs):
         return {self.idx[i] for i in idxs if self.idx[i] is not None}
 
+    # Tests that read only the *input* statements (even positions) of a load_sql_fixture_pairs file:
+    # test_executor runs `sql` and compares it with duckdb; the expected (optimized) text is unused.
+    INPUT_ONLY = {
+        "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": {"tests/test_executor.py::TestExecutor::test_execute_tpcds"},
+        "tests/fixtures/optimizer/tpc-h/tpc-h.sql": {"tests/test_executor.py::TestExecutor::test_execute_tpch"},
+    }
+
+    def only_expected_changed(self, path, info):
+        """True if every changed line of a fixture-pairs file lies in an odd (expected) statement and
+        no ';' (statement boundary) was added or removed."""
+        try:
+            old = (SRC / path).read_text(encoding="utf-8").split("\n")
+        except Exception:
+            return False
+        if any(";" in l for l in info["added"]) or any(";" in l for l in info["removed_text"]):
+            return False
+        # statement index at the start of each line, counting ';' only on lines the loader keeps
+        idx_at = []
+        n = 0
+        for line in old:
+            idx_at.append(n)
+            if line and not line.startswith("--"):
+                n += line.count(";")
+        touched = set(info["removed"]) | set(info["anchors"])
+        if not touched:
+            return False
+        for ln in touched:
+            if not (1 <= ln <= len(old)):
+                return False
+            if idx_at[ln - 1] % 2 != 1:
+                return False
+            # an anchor next to a boundary line could belong to either statement
+            line = old[ln - 1]
+            if ";" in line and ln in info["anchors"]:
+                return False
+        return True
+
     def tests_of_file(self, f):
         """Every test that executed any line of source file f."""
         if f not in self.filetests:
@@ -256,6 +293,9 @@ class Selector:
                 if p == path:
                     hit |= self.nums(idxs)
             if hit:
+                if path in self.INPUT_ONLY and self.only_expected_changed(path, info):
+                    drop = {t["number"] for t in self.tests if t["id"] in self.INPUT_ONLY[path]}
+                    return hit - drop, "fixture-expected-only"
                 return hit, "fixture"
             folder = os.path.dirname(path)
             for p, idxs in self.opens.items():
