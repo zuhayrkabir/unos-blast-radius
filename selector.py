@@ -108,6 +108,37 @@ def apply_patch_text(orig_lines, patch_text, path):
     return "\n".join(out)
 
 
+# ------------------------------------------------------------------ behaviour-preserving rewrites
+def _singleton(node):
+    """None, or an enum-style constant such as TokenType.SELECT / NormalizationStrategy.UPPERCASE.
+    (True/False are excluded: 1 == True but 1 is not True.)"""
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    if isinstance(node, ast.Attribute) and node.attr.isupper() and len(node.attr) > 1 \
+            and isinstance(node.value, ast.Name) and node.value.id[:1].isupper() and not node.value.id.isupper():
+        return True
+    return False
+
+
+class _CmpNorm(ast.NodeTransformer):
+    """x is C  ==  x == C, and x is not C  ==  x != C, when C is None/True/False or an enum member."""
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and (_singleton(node.comparators[0]) or _singleton(node.left)):
+            op = node.ops[0]
+            if isinstance(op, ast.Eq):
+                node.ops = [ast.Is()]
+            elif isinstance(op, ast.NotEq):
+                node.ops = [ast.IsNot()]
+        return node
+
+
+def _norm_dump(tree):
+    import copy
+    return ast.dump(_CmpNorm().visit(copy.deepcopy(tree)))
+
+
 # ------------------------------------------------------------------ static structure of sources
 _struct_cache = {}
 
@@ -175,6 +206,7 @@ class Selector:
         self.imp = {f: set(v) for f, v in m["import_lines"].items()}
         self.opens = m["opens"]
         self.dialect_users = m.get("dialect_users", {})
+        self.expr_users = m.get("expr_users", {})
         self.filetests = {}
         self._trees = {}
         self._src_cache = None
@@ -278,6 +310,8 @@ class Selector:
                 old_tree = self._tree(path)
                 if old_tree is not None and ast.dump(old_tree) == ast.dump(new_tree):
                     return set(), "ast-same"
+                if old_tree is not None and _norm_dump(old_tree) == _norm_dump(new_tree):
+                    return set(), "equiv-compare"
             except Exception:
                 pass
         covered = self.lines.get(path, {})
@@ -327,12 +361,21 @@ class Selector:
                     why.add("fn")
                 elif cls is not None:
                     names = self.assigned_names(path, ln)
-                    out |= self.tests_of_span(path, cls[0], cls[1]) | self.tests_of_file(path)
                     fam = self.family(path)
+                    if names and not fam and cls[3] in self.expr_users and not (names & self.REGISTRY_NAMES):
+                        out |= self.nums(self.expr_users[cls[3]])
+                        why.add("expr-attr")
+                        continue
+                    out |= self.tests_of_span(path, cls[0], cls[1]) | self.tests_of_file(path)
                     if names and fam:
                         users = self.family_users(fam)
                         out |= self.readers(names) & users
                         why.add("dialect-attr")
+                    elif names and cls[3] in self.expr_users and not (names & self.REGISTRY_NAMES):
+                        # attribute of an expression type: only tests that built that type (or a subclass) can see it
+                        users = self.nums(self.expr_users[cls[3]])
+                        out |= self.readers(names) & users
+                        why.add("expr-attr")
                     elif names:
                         out |= self.readers(names)
                         why.add("class-attr")
@@ -407,6 +450,10 @@ class Selector:
             return []
         return [(n.lineno, n.end_lineno) for n in ast.walk(tree) if isinstance(n, ast.Lambda)]
 
+    # attributes that decide which expression type the parser builds for a name: changing them can
+    # affect tests that never built this type, so they keep the broad treatment
+    REGISTRY_NAMES = {"_sql_names", "key", "sql_names", "_sql_name"}
+
     FAMILY_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/tokenizers/", "sqlglot/typing/")
     GENERIC = {"dialect", "__init__", "base"}
 
@@ -475,8 +522,52 @@ class Selector:
                     names.add(n.attr)
         return {n for n in names if len(n) > 2}
 
+    def _assignments(self):
+        """(targets, referenced names) for every assignment statement in sqlglot (parsed once)."""
+        if getattr(self, "_asg", None) is None:
+            out = []
+            for f in self._sources():
+                tree = self._tree(f)
+                if tree is None:
+                    continue
+                for n in ast.walk(tree):
+                    if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and n.value is not None:
+                        tg = n.targets if isinstance(n, ast.Assign) else [n.target]
+                        tnames = set()
+                        for t in tg:
+                            for x in ast.walk(t):
+                                if isinstance(x, ast.Name):
+                                    tnames.add(x.id)
+                                elif isinstance(x, ast.Attribute):
+                                    tnames.add(x.attr)
+                        refs = set()
+                        for x in ast.walk(n.value):
+                            if isinstance(x, ast.Name):
+                                refs.add(x.id)
+                            elif isinstance(x, ast.Attribute):
+                                refs.add(x.attr)
+                        out.append((tnames, refs))
+            self._asg = out
+        return self._asg
+
+    def derived(self, names, rounds=3):
+        """Names computed from `names` anywhere in sqlglot, e.g. the metaclass builds
+        INVERSE_TIME_MAPPING / TIME_TRIE from TIME_MAPPING."""
+        names = set(names)
+        for _ in range(rounds):
+            new = set()
+            for tnames, refs in self._assignments():
+                if refs & names:
+                    # only class-constant style names (TIME_TRIE, INVERSE_TIME_MAPPING, ...)
+                    new |= {t for t in tnames if len(t) > 2 and t not in names and re.fullmatch(r"_?[A-Z][A-Z0-9_]+", t)}
+            if not new:
+                break
+            names |= new
+        return names
+
     def readers(self, names):
-        """Tests that ran any sqlglot source line mentioning one of `names`."""
+        """Tests that ran any sqlglot source line mentioning one of `names` (or a name derived from them)."""
+        names = self.derived(names)
         pat = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b")
         out = set()
         for f, src in self._sources().items():
