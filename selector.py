@@ -285,7 +285,43 @@ class Selector:
                                                                      "sqlglot/optimizer/", "sqlglot/generators/python.py",
                                                                      "sqlglot/dialects/python.py", "sqlglot/schema.py",
                                                                      "tests/test_executor.py", "tests/fixtures/optimizer/tpc-ds/"),
+        "tests/test_executor.py::TestExecutor::test_execute_tpch": ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/serde.py",
+                                                                    "sqlglot/optimizer/", "sqlglot/generators/python.py",
+                                                                    "sqlglot/dialects/python.py", "sqlglot/schema.py",
+                                                                    "tests/test_executor.py", "tests/fixtures/optimizer/tpc-h/"),
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/serde.py",
+                                                                      "sqlglot/optimizer/", "sqlglot/generators/python.py",
+                                                                      "sqlglot/dialects/python.py", "sqlglot/schema.py",
+                                                                      "tests/test_executor.py", "tests/fixtures/optimizer/tpc-h/"),
     }
+    # test_generator_memory builds every dialect's generator 1000x and checks for leaks: only code that runs
+    # while constructing a generator (an __init__/__new__ of generator/dialect machinery) can break it.
+    MEMORY_TEST = "tests/test_generator.py::TestGenerator::test_generator_memory"
+    MEMORY_FILES = ("sqlglot/generator.py", "sqlglot/generators/", "sqlglot/dialects/", "sqlglot/tokens.py",
+                    "sqlglot/expressions/", "sqlglot/helper.py", "tests/test_generator.py")
+
+    def touches_constructor(self, files):
+        for path, info in files.items():
+            if not path.endswith(".py"):
+                continue
+            if not any(path.startswith(p) for p in self.MEMORY_FILES):
+                continue
+            if path.startswith("tests/"):
+                return True
+            spans, doc, src = structure(path)
+            for ln in set(info["removed"]) | set(info["anchors"]):
+                fn = innermost(spans, ln, "def")
+                if fn is None or fn[3] in ("__init__", "__new__", "__init_subclass__", "__call__") or "meta" in (fn[4] or "").lower():
+                    # module/class level code, or a constructor: keep the test
+                    if fn is None:
+                        cls = innermost(spans, ln, "class")
+                        if cls is not None and path.startswith(("sqlglot/dialects/", "sqlglot/generators/")):
+                            # a plain class attribute of a dialect/generator is shared, not per instance
+                            names = self.assigned_names(path, ln)
+                            if names:
+                                continue
+                    return True
+        return False
 
     def select(self, patch_text):
         files = parse_patch(patch_text)
@@ -301,6 +337,10 @@ class Selector:
                 if n in sel and not any(p.startswith(pre) for p in files for pre in prefixes):
                     sel.discard(n)
                     reasons.append(f"risky-drop:{tid.split('::')[-1]}")
+            n = self.id2num.get(self.MEMORY_TEST)
+            if n in sel and not self.touches_constructor(files):
+                sel.discard(n)
+                reasons.append("risky-drop:test_generator_memory")
         return sel, reasons
 
     def for_file(self, path, info, patch_text):
