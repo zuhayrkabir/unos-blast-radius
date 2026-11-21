@@ -18,6 +18,7 @@ HERE = Path(__file__).resolve().parent
 SRC = Path(os.environ.get("SQLGLOT_SRC", str(HERE / "sqlglot")))  # pinned checkout (sources only)
 MAP = HERE / "map.json.gz"
 WORKER_COST = 2.0
+RISKY = os.environ.get("RISKY", "1") == "1"   # risky build: drop the two slowest tests unless clearly relevant
 
 
 def log(*a):
@@ -207,6 +208,7 @@ class Selector:
         # the map is keyed by test id so it survives renumbering
         ids = m["ids"]
         id2num = {t["id"]: t["number"] for t in self.tests}
+        self.id2num = id2num
         self.idx = [id2num.get(i) for i in ids]
         self.lines = m["lines"]
         self.imp = {f: set(v) for f, v in m["import_lines"].items()}
@@ -275,6 +277,16 @@ class Selector:
                 s.update(v)
         return self.nums(s)
 
+    # Risky mode: the slowest tests are kept only when the change is in code they are built around.
+    SLOW_GUARDS = {
+        "tests/test_parser.py::TestParser::test_max_nodes": ("sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
+                                                            "sqlglot/errors.py", "sqlglot/parsers/__init__.py", "tests/test_parser.py"),
+        "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/serde.py",
+                                                                     "sqlglot/optimizer/", "sqlglot/generators/python.py",
+                                                                     "sqlglot/dialects/python.py", "sqlglot/schema.py",
+                                                                     "tests/test_executor.py", "tests/fixtures/optimizer/tpc-ds/"),
+    }
+
     def select(self, patch_text):
         files = parse_patch(patch_text)
         sel = set()
@@ -283,6 +295,12 @@ class Selector:
             s, why = self.for_file(path, info, patch_text)
             sel |= s
             reasons.append(f"{path}:{why}:{len(s)}")
+        if RISKY and len(sel) < len(self.all):
+            for tid, prefixes in self.SLOW_GUARDS.items():
+                n = self.id2num.get(tid)
+                if n in sel and not any(p.startswith(pre) for p in files for pre in prefixes):
+                    sel.discard(n)
+                    reasons.append(f"risky-drop:{tid.split('::')[-1]}")
         return sel, reasons
 
     def for_file(self, path, info, patch_text):
