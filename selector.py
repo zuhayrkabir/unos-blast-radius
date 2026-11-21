@@ -174,6 +174,7 @@ class Selector:
         self.lines = m["lines"]
         self.imp = {f: set(v) for f, v in m["import_lines"].items()}
         self.opens = m["opens"]
+        self.dialect_users = m.get("dialect_users", {})
         self.filetests = {}
         self._trees = {}
         self._src_cache = None
@@ -438,6 +439,9 @@ class Selector:
         for f in self.lines:
             if self.family(f) in fams:
                 users |= self.tests_of_file(f)
+        # tests that actually instantiated the dialect (or a subclass of it), recorded on the pinned commit
+        for fm in fams:
+            users |= self.nums(self.dialect_users.get(fm, []))
         # tests named after the dialect (tests/dialects/test_<fam>.py)
         for fm in fams:
             users |= set(self.by_file.get(f"tests/dialects/test_{fm}.py", []))
